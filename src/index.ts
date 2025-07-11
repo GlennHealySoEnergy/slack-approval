@@ -7,9 +7,14 @@ const signingSecret = process.env.SLACK_SIGNING_SECRET || "";
 const slackAppToken = process.env.SLACK_APP_TOKEN || "";
 const channel_id = process.env.SLACK_CHANNEL_ID || "";
 const baseMessageTs = core.getInput("baseMessageTs");
-const requiredApprovers = core
+const requiredApproversInput = core
   .getInput("approvers", { required: true, trimWhitespace: true })
   ?.split(",");
+
+// Will be filled with user IDs (Uxxxx) and user group IDs (Sxxxx)
+let requiredApprovers: string[] = [];
+let userGroupIds: string[] = [];
+let userGroupMentions: string[] = [];
 const minimumApprovalCount = Number(core.getInput("minimumApprovalCount")) || 1;
 const baseMessagePayload = JSON.parse(
   core.getMultilineInput("baseMessagePayload").join("")
@@ -32,12 +37,7 @@ const app = new App({
   logLevel: LogLevel.DEBUG,
 });
 
-if (minimumApprovalCount > requiredApprovers.length) {
-  console.error(
-    "Error: Insufficient approvers. Minimum required approvers not met."
-  );
-  process.exit(1);
-}
+// We'll check for minimum after expanding user groups
 function hasPayload(inputs: any) {
   return inputs.text?.length > 0 || inputs.blocks?.length > 0;
 }
@@ -45,6 +45,59 @@ function hasPayload(inputs: any) {
 async function run(): Promise<void> {
   try {
     const web = new WebClient(token);
+
+    // Helper: get user IDs from a user group (subteam)
+    async function getUserIdsFromUserGroup(usergroupId: string): Promise<string[]> {
+      try {
+        const res = await web.usergroups.users.list({ usergroup: usergroupId });
+        if (res.ok && Array.isArray(res.users)) {
+          return res.users as string[];
+        }
+      } catch (e) {
+        console.error(`Failed to fetch users for user group ${usergroupId}:`, e);
+      }
+      return [];
+    }
+
+    // Parse requiredApproversInput for user groups (subteams) and users
+    // Slack user group mention: <@Uxxxx> for user, <@subteam^Sxxxx> for user group
+    // Accept both Sxxxx and <@subteam^Sxxxx> for user group
+    for (const entry of requiredApproversInput) {
+      const trimmed = entry.trim();
+      // User group: <@subteam^SXXXX> or SXXXX
+      const userGroupMatch = trimmed.match(/^<@subteam\^(S[A-Z0-9]+)>$/i) || trimmed.match(/^(S[A-Z0-9]+)$/i);
+      if (userGroupMatch) {
+        const groupId = userGroupMatch[1] || userGroupMatch[0];
+        userGroupIds.push(groupId);
+        userGroupMentions.push(`<@subteam^${groupId}>`);
+        continue;
+      }
+
+      const userMatch = trimmed.match(/^<@(U[A-Z0-9]+)>$/i) || trimmed.match(/^(U[A-Z0-9]+)$/i);
+      if (userMatch) {
+        requiredApprovers.push(userMatch[1] || userMatch[0]);
+        continue;
+      }
+      // fallback: treat as user id
+      requiredApprovers.push(trimmed);
+    }
+
+    // Expand user groups to user IDs
+    for (const groupId of userGroupIds) {
+      const users = await getUserIdsFromUserGroup(groupId);
+      for (const u of users) {
+        if (!requiredApprovers.includes(u)) {
+          requiredApprovers.push(u);
+        }
+      }
+    }
+
+    if (minimumApprovalCount > requiredApprovers.length) {
+      console.error(
+        `Error: Insufficient approvers. Minimum required approvers not met. (Have: ${requiredApprovers.length}, Need: ${minimumApprovalCount})`
+      );
+      process.exit(1);
+    }
 
     const github_server_url = process.env.GITHUB_SERVER_URL || "";
     const github_repos = process.env.GITHUB_REPOSITORY || "";
@@ -100,17 +153,17 @@ async function run(): Promise<void> {
         };
 
     const renderReplyTitle = () => {
+      // Tag user groups (Slack will notify the group)
+      let groupMentions = userGroupMentions.length > 0 ? userGroupMentions.join(", ") : "";
+      // List remaining individual users
+      let userMentions = requiredApprovers.length > 0 ? requiredApprovers.map((v) => `<@${v}>`).join(", ") : "";
+      let approverMentions = approvers.length > 0 ? `Approvers: ${approvers.map((v) => `<@${v}>`).join(", ")} ` : "";
+      let mentionLine = [groupMentions, userMentions].filter(Boolean).join(", ");
       return {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `*Required Approvers Count:* ${minimumApprovalCount}\n*Remaining Approvers:* ${requiredApprovers
-            .map((v) => `<@${v}>`)
-            .join(", ")}\n${
-            approvers.length > 0
-              ? `Approvers: ${approvers.map((v) => `<@${v}>`).join(", ")} `
-              : ""
-          }\n`,
+          text: `*Required Approvers Count:* ${minimumApprovalCount}\n*Remaining Approvers:* ${mentionLine}\n${approverMentions}\n`,
         },
       };
     };
@@ -310,3 +363,4 @@ async function run(): Promise<void> {
 }
 
 run();
+
